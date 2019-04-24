@@ -127,7 +127,32 @@ struct blk_user_trace_setup {
 	__u64 start_lba;
 	__u64 end_lba;
 	__u32 pid;
+#ifdef CONFIG_RBLKTRACE
+	int use_rdma;// input
+#endif
 };
+
+
+#ifdef CONFIG_RBLKTRACE
+
+#define RBLKTRACE_HEADER_MAGIC 0x0123456789ABCDEFL
+
+// Per-cpu relay buffer header; located at the start of the first sub-buffer
+typedef struct rblktrace_buf_header {
+	//NOTE: the fields are volatile since they are RDMA-read/written
+	volatile size_t consumed;
+	volatile size_t magic;
+	volatile size_t produced;
+	volatile size_t padding[];// entry per sub-buffer
+} rblktrace_buf_header_t;
+
+static inline size_t rblktrace_buf_header_size(size_t n_subbufs)
+{
+	return sizeof(rblktrace_buf_header_t) + n_subbufs * sizeof(size_t);
+}
+
+#endif// CONFIG_RBLKTRACE
+
 
 #define BLKTRACESETUP _IOWR(0x12,115,struct blk_user_trace_setup)
 #define BLKTRACESTART _IO(0x12,116)

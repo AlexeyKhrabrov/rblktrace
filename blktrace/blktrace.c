@@ -53,6 +53,13 @@
 #include "btt/list.h"
 #include "blktrace.h"
 
+#ifdef RBLKTRACE
+#include <assert.h>
+#include <stdbool.h>
+#include <time.h>
+#include <rdma/rdma_verbs.h>
+#endif
+
 /*
  * You may want to increase this even more, if you are logging at a high
  * rate and see skipped/missed events
@@ -69,6 +76,10 @@ enum {
 	Net_none = 0,
 	Net_server,
 	Net_client,
+#ifdef RBLKTRACE
+	Net_server_rdma,
+	Net_client_rdma,
+#endif
 };
 
 enum thread_status {
@@ -114,6 +125,10 @@ struct devpath {
 	time_t cl_connect_time;
 	int setup_done;	/* ioctl BLKTRACESETUP done */
 	struct io_info *ios;
+
+#ifdef RBLKTRACE
+	struct rbt_cli_buf *rdma_bufs;
+#endif
 };
 
 /*
@@ -329,7 +344,22 @@ static int *cl_fds;
 static int (*handle_pfds)(struct tracer *, int, int);
 static int (*handle_list)(struct tracer_devpath_head *, struct list_head *);
 
+#ifdef RBLKTRACE
+
+static bool use_rdma = false;
+static const char *rdma_port = "8463";
+static int max_ncpus = 64;
+static int max_ndevs = 4;
+static int rdma_interval = 10;// msec
+
+#endif
+
+#ifdef RBLKTRACE
+#define S_OPTS	"d:a:A:r:o:kw:vVb:n:D:lh:p:sI:R::m:M:i:"
+#else
 #define S_OPTS	"d:a:A:r:o:kw:vVb:n:D:lh:p:sI:"
+#endif
+
 static struct option l_opts[] = {
 	{
 		.name = "dev",
@@ -433,45 +463,89 @@ static struct option l_opts[] = {
 		.flag = NULL,
 		.val = 's'
 	},
+#ifdef RBLKTRACE
+	// RDMA network mode arguments
+	{
+		.name = "rdma",
+		.has_arg = optional_argument,
+		.flag = NULL,
+		.val = 'R'
+	},
+	{
+		.name = "max-ncpus",
+		.has_arg = required_argument,
+		.flag = NULL,
+		.val = 'm'
+	},
+	{
+		.name = "max-ndevs",
+		.has_arg = required_argument,
+		.flag = NULL,
+		.val = 'M'
+	},
+	{
+		.name = "rdma-interval",
+		.has_arg = required_argument,
+		.flag = NULL,
+		.val = 'P'
+	},
+#endif// RBLKTRACE
 	{
 		.name = NULL,
 	}
 };
 
-static char usage_str[] = "\n\n" \
-	"-d <dev>             | --dev=<dev>\n" \
-        "[ -r <debugfs path>  | --relay=<debugfs path> ]\n" \
-        "[ -o <file>          | --output=<file>]\n" \
-        "[ -D <dir>           | --output-dir=<dir>\n" \
-        "[ -w <time>          | --stopwatch=<time>]\n" \
-        "[ -a <action field>  | --act-mask=<action field>]\n" \
-        "[ -A <action mask>   | --set-mask=<action mask>]\n" \
-        "[ -b <size>          | --buffer-size]\n" \
-        "[ -n <number>        | --num-sub-buffers=<number>]\n" \
-        "[ -l                 | --listen]\n" \
-        "[ -h <hostname>      | --host=<hostname>]\n" \
-        "[ -p <port number>   | --port=<port number>]\n" \
-        "[ -s                 | --no-sendfile]\n" \
-        "[ -I <devs file>     | --input-devs=<devs file>]\n" \
-        "[ -v <version>       | --version]\n" \
-        "[ -V <version>       | --version]\n" \
+static char usage_str[] = "\n\n"
+	"-d <dev>             | --dev=<dev>\n"
+	"[ -r <debugfs path>  | --relay=<debugfs path> ]\n"
+	"[ -o <file>          | --output=<file>]\n"
+	"[ -D <dir>           | --output-dir=<dir>\n"
+	"[ -w <time>          | --stopwatch=<time>]\n"
+	"[ -a <action field>  | --act-mask=<action field>]\n"
+	"[ -A <action mask>   | --set-mask=<action mask>]\n"
+	"[ -b <size>          | --buffer-size]\n"
+	"[ -n <number>        | --num-sub-buffers=<number>]\n"
+	"[ -l                 | --listen]\n"
+	"[ -h <hostname>      | --host=<hostname>]\n"
+	"[ -p <port number>   | --port=<port number>]\n"
+	"[ -s                 | --no-sendfile]\n"
+	"[ -I <devs file>     | --input-devs=<devs file>]\n"
+	"[ -v <version>       | --version]\n"
+	"[ -V <version>       | --version]\n"
+#ifdef RBLKTRACE
+	"[ -R[<port number>]  | --rdma[=<port number>]]\n"
+	"[ -m <number>        | --max-ncpus=<number>]\n"
+	"[ -M <number>        | --max-ndevs=<number>]\n"
+	"[ -i <msec>          | --rdma-interval=<msec>]\n"
+#endif
 
-	"\t-d Use specified device. May also be given last after options\n" \
-	"\t-r Path to mounted debugfs, defaults to /sys/kernel/debug\n" \
-	"\t-o File(s) to send output to\n" \
-	"\t-D Directory to prepend to output file names\n" \
-	"\t-w Stop after defined time, in seconds\n" \
-	"\t-a Only trace specified actions. See documentation\n" \
-	"\t-A Give trace mask as a single value. See documentation\n" \
-	"\t-b Sub buffer size in KiB (default 512)\n" \
-	"\t-n Number of sub buffers (default 4)\n" \
-	"\t-l Run in network listen mode (blktrace server)\n" \
-	"\t-h Run in network client mode, connecting to the given host\n" \
-	"\t-p Network port to use (default 8462)\n" \
-	"\t-s Make the network client NOT use sendfile() to transfer data\n" \
-	"\t-I Add devices found in <devs file>\n" \
-	"\t-v Print program version info\n" \
-	"\t-V Print program version info\n\n";
+	"\t-d Use specified device. May also be given last after options\n"
+	"\t-r Path to mounted debugfs, defaults to /sys/kernel/debug\n"
+	"\t-o File(s) to send output to\n"
+	"\t-D Directory to prepend to output file names\n"
+	"\t-w Stop after defined time, in seconds\n"
+	"\t-a Only trace specified actions. See documentation\n"
+	"\t-A Give trace mask as a single value. See documentation\n"
+	"\t-b Sub buffer size in KiB (default 512)\n"
+#ifdef RBLKTRACE
+	"\t-n Number of sub buffers (default 16 in RDMA mode, 4 otherwise)\n"
+#else
+	"\t-n Number of sub buffers (default 4)\n"
+#endif
+	"\t-l Run in network listen mode (blktrace server)\n"
+	"\t-h Run in network client mode, connecting to the given host\n"
+	"\t-p Network port to use (default 8462)\n"
+	"\t-s Make the network client NOT use sendfile() to transfer data\n"
+	"\t-I Add devices found in <devs file>\n"
+	"\t-v Print program version info\n"
+	"\t-V Print program version info\n"
+#ifdef RBLKTRACE
+	"\t-R Use RDMA network mode; default port 8463\n"
+	"\t-m Maximum number of client CPUs (default 64)\n"
+	"\t-M Maximum number of client devices (default 4)\n"
+	"\t-i RDMA server read interval in milliseconds (default 10)\n"
+#endif
+	"\n";
 
 static void clear_events(struct pollfd *pfd)
 {
@@ -696,6 +770,21 @@ static int my_open(const char *path, int flags)
 
 	return fd;
 }
+
+#ifdef RBLKTRACE
+
+static int my_open3(const char *path, int flags, mode_t mode)
+{
+	int fd;
+
+	do {
+		fd = open(path, flags, mode);
+	} while (fd < 0 && handle_open_failure());
+
+	return fd;
+}
+
+#endif// RBLKTRACE
 
 static int my_socket(int domain, int type, int protocol)
 {
@@ -1080,6 +1169,9 @@ static int setup_buts(void)
 		buts.buf_size = buf_size;
 		buts.buf_nr = buf_nr;
 		buts.act_mask = act_mask;
+#ifdef RBLKTRACE
+		buts.use_rdma = (net_mode == Net_client_rdma);
+#endif
 
 		if (ioctl(dpp->fd, BLKTRACESETUP, &buts) >= 0) {
 			dpp->ncpus = max_cpus;
@@ -1510,8 +1602,7 @@ static inline int net_sendfile_data(struct tracer *tp, struct io_info *iop)
 	return net_sendfile(iop);
 }
 
-static int fill_ofname(char *dst, int dstlen, char *subdir, char *buts_name,
-		       int cpu)
+static int fill_ofname(char *dst, int dstlen, const char *subdir, const char *buts_name, int cpu)
 {
 	int len;
 	struct stat sb;
@@ -2032,6 +2123,10 @@ static void handle_sigint(__attribute__((__unused__)) int sig)
 	stop_tracers();
 }
 
+#ifdef RBLKTRACE
+static const char *rbt_client_hostname(struct devpath *dpp);
+#endif
+
 static void show_stats(struct list_head *devpaths)
 {
 	FILE *ofp;
@@ -2053,6 +2148,11 @@ static void show_stats(struct list_head *devpaths)
 		if (net_mode == Net_server)
 			printf("server: end of run for %s:%s\n",
 				dpp->ch->hostname, dpp->buts_name);
+#ifdef RBLKTRACE
+		if (net_mode == Net_server_rdma) {
+			printf("rdma server: end of run for %s:%s\n", rbt_client_hostname(dpp), dpp->buts_name);
+		}
+#endif
 
 		data_read = 0;
 		nevents = 0;
@@ -2077,7 +2177,7 @@ static void show_stats(struct list_head *devpaths)
 
 		fprintf(ofp, "  Total:  %20llu events (dropped %llu),"
 			     " %8llu KiB data\n", nevents,
-			     dpp->drops, (data_read + 1024) >> 10);
+			     dpp->drops, (data_read + 1023) >> 10);
 
 		total_drops += dpp->drops;
 		total_events += (nevents + dpp->drops);
@@ -2105,6 +2205,10 @@ static int handle_args(int argc, char *argv[])
 	int c, i;
 	struct statfs st;
 	int act_mask_tmp = 0;
+
+#ifdef RBLKTRACE
+	bool buf_nr_set = false;
+#endif
 
 	while ((c = getopt_long(argc, argv, S_OPTS, l_opts, NULL)) >= 0) {
 		switch (c) {
@@ -2195,6 +2299,9 @@ static int handle_args(int argc, char *argv[])
 					"Invalid buffer nr (%lu)\n", buf_nr);
 				return 1;
 			}
+#ifdef RBLKTRACE
+			buf_nr_set = true;
+#endif
 			break;
 		case 'D':
 			output_dir = optarg;
@@ -2214,6 +2321,32 @@ static int handle_args(int argc, char *argv[])
 		case 's':
 			net_use_sendfile = 0;
 			break;
+
+#ifdef RBLKTRACE
+		case 'R':
+			use_rdma = true;
+			if (optarg != NULL) rdma_port = optarg;
+			break;
+		case 'm':
+			if ((max_ncpus = atoi(optarg)) <= 0) {
+				fprintf(stderr, "Invalid maximum number of client CPUs (%s)\n", optarg);
+				return 1;
+			}
+			break;
+		case 'M':
+			if ((max_ndevs = atoi(optarg)) <= 0) {
+				fprintf(stderr, "Invalid maximum number of client devices (%s)\n", optarg);
+				return 1;
+			}
+			break;
+		case 'i':
+			if ((rdma_interval = atoi(optarg)) <= 0) {
+				fprintf(stderr, "Invalid RDMA read interval (%s)\n", optarg);
+				return 1;
+			}
+			break;
+#endif// RBLKTRACE
+
 		default:
 			show_usage(argv[0]);
 			exit(1);
@@ -2221,11 +2354,26 @@ static int handle_args(int argc, char *argv[])
 		}
 	}
 
+#ifdef RBLKTRACE
+	if (use_rdma) {
+		switch (net_mode) {
+			case Net_server: net_mode = Net_server_rdma; break;
+			case Net_client: net_mode = Net_client_rdma; break;
+		}
+	}
+	if ((net_mode == Net_client_rdma) && !buf_nr_set) buf_nr = 16;
+#endif
+
 	while (optind < argc)
 		if (add_devpath(argv[optind++]) != 0)
 			return 1;
 
-	if (net_mode != Net_server && ndevs == 0) {
+#ifdef RBLKTRACE
+	if (net_mode != Net_server && net_mode != Net_server_rdma && ndevs == 0)
+#else
+	if (net_mode != Net_server && ndevs == 0)
+#endif
+	{
 		show_usage(argv[0]);
 		return 1;
 	}
@@ -2786,6 +2934,11 @@ static cpu_set_t *get_online_cpus(void)
 	return set;
 }
 
+#ifdef RBLKTRACE
+static int net_client_rdma(void);
+static int net_server_rdma(void);
+#endif
+
 int main(int argc, char *argv[])
 {
 	int ret = 0;
@@ -2834,6 +2987,16 @@ int main(int argc, char *argv[])
 			output_name = NULL;
 		}
 		ret = net_server();
+#ifdef RBLKTRACE
+	} else if (net_mode == Net_server_rdma) {
+		if (output_name) {
+			fprintf(stderr, "-o ignored in server mode\n");
+			output_name = NULL;
+		}
+		ret = net_server_rdma();
+	} else if (net_mode == Net_client_rdma) {
+		ret = net_client_rdma();
+#endif// RBLKTRACE
 	} else
 		ret = run_tracers();
 
@@ -2843,3 +3006,1540 @@ out:
 	rel_devpaths();
 	return ret;
 }
+
+
+#ifdef RBLKTRACE
+
+
+//NOTE: we only support clients and servers with the same CPU architecture (word size and endianness)
+
+typedef struct rbt_buf_info {
+	void *addr;
+	uint32_t read_rkey;
+	uint32_t write_rkey;
+} rbt_buf_info_t;
+
+
+typedef struct rbt_dev_info {
+	char buts_name[32];
+	rbt_buf_info_t bufs[];
+} rbt_dev_info_t;
+
+static inline size_t rbt_dev_info_size(size_t ncpus)
+{
+	return sizeof(rbt_dev_info_t) + ncpus * sizeof(rbt_buf_info_t);
+}
+
+
+typedef struct rbt_open_req {
+	uint32_t magic;
+	int ndevs;
+	int ncpus;
+	int buf_size;
+	int buf_nr;
+	char data[];
+} rbt_open_req_t;
+
+static inline size_t rbt_open_req_size(size_t ndevs, size_t ncpus)
+{
+	return sizeof(rbt_open_req_t) + ndevs * rbt_dev_info_size(ncpus);
+}
+
+static inline rbt_dev_info_t *rbt_dev_info_at(rbt_open_req_t *req, int idx)
+{
+	assert(req != NULL);
+	assert(idx < req->ndevs);
+	return (rbt_dev_info_t*)(req->data + idx * rbt_dev_info_size(req->ncpus));
+}
+
+
+typedef struct rbt_open_resp {
+	uint32_t magic;
+	bool result;
+} rbt_open_resp_t;
+
+
+typedef struct rbt_close_req {
+	uint32_t magic;
+	unsigned long long drops[];
+} rbt_close_req_t;
+
+static inline size_t rbt_close_req_size(size_t ndevs)
+{
+	return sizeof(rbt_close_req_t) + ndevs * sizeof(unsigned long long);
+}
+
+
+typedef struct rbt_close_resp {
+	uint32_t magic;
+	unsigned long long data_read[];
+} rbt_close_resp_t;
+
+static inline size_t rbt_close_resp_size(size_t ndevs, size_t ncpus)
+{
+	return sizeof(rbt_close_resp_t) + ndevs * ncpus * sizeof(unsigned long long);
+}
+
+static inline unsigned long long *rbt_data_read_at(rbt_close_resp_t *resp, size_t ncpus, size_t dev_idx, size_t cpu_idx)
+{
+	assert(resp != NULL);
+	assert(cpu_idx < ncpus);
+	return &(resp->data_read[dev_idx * ncpus + cpu_idx]);
+}
+
+
+static void *my_malloc(size_t size)
+{
+	assert(size != 0);
+	void *ptr = malloc(size);
+	if (ptr == NULL) fprintf(stderr, "malloc(%zu): %s\n", size, strerror(errno));
+	return ptr;
+}
+
+static void *my_calloc(size_t size)
+{
+	assert(size != 0);
+	void *ptr = calloc(1, size);
+	if (ptr == NULL) fprintf(stderr, "calloc(%zu): %s\n", size, strerror(errno));
+	return ptr;
+}
+
+static void *my_realloc(void *old, size_t size)
+{
+	assert(size != 0);
+	void *ptr = realloc(old, size);
+	if (ptr == NULL) fprintf(stderr, "realloc(%zu): %s\n", size, strerror(errno));
+	return ptr;
+}
+
+static char *my_strdup(const char *str)
+{
+	assert(str != NULL);
+	char *s = strdup(str);
+	if (s == NULL) perror("strdup");
+	return s;
+}
+
+
+typedef struct rdma_cm_id rdma_cm_id_t;
+typedef struct ibv_mr ibv_mr_t;
+
+static ibv_mr_t *rbt_reg_msgs(rdma_cm_id_t *id, void *addr, size_t length)
+{
+	assert(id != NULL);
+	assert(addr != NULL);
+
+	ibv_mr_t *mr = rdma_reg_msgs(id, addr, length);
+	if (mr == NULL) fprintf(stderr, "rdma_reg_msgs(%zu): %s\n", length, strerror(errno));
+	return mr;
+}
+
+static ibv_mr_t *rbt_msg_buf_create(rdma_cm_id_t *id, size_t size)
+{
+	assert(id != NULL);
+
+	void *buf = my_malloc(size);
+	if (buf == NULL) return NULL;
+
+	ibv_mr_t *mr = rbt_reg_msgs(id, buf, size);
+	if (mr == NULL) free(buf);
+	return mr;
+}
+
+static void rbt_msg_buf_destroy(ibv_mr_t *mr)
+{
+	assert(mr != NULL);
+	void *buf = mr->addr;
+	rdma_dereg_mr(mr);
+	free(buf);
+}
+
+
+static bool rbt_post_send(rdma_cm_id_t *id, void *ctx, void *addr, size_t length, ibv_mr_t *mr, int flags)
+{
+	assert(id != NULL);
+	assert(addr != NULL);
+
+	if (rdma_post_send(id, ctx, addr, length, mr, flags) < 0) {
+		perror("rdma_post_send");
+		return false;
+	}
+	return true;
+}
+
+static bool rbt_post_recv(rdma_cm_id_t *id, void *ctx, void *addr, size_t length, ibv_mr_t *mr)
+{
+	assert(id != NULL);
+	assert(addr != NULL);
+	assert(mr != NULL);
+
+	if (rdma_post_recv(id, ctx, addr, length, mr) < 0) {
+		perror("rdma_post_recv");
+		return false;
+	}
+	return true;
+}
+
+
+typedef struct ibv_wc ibv_wc_t;
+
+static bool rbt_get_send_comp(rdma_cm_id_t *id, ibv_wc_t *wc)
+{
+	assert(id != NULL);
+	assert(wc != NULL);
+
+	int n = rdma_get_send_comp(id, wc);
+	if (n < 0) {
+		perror("rdma_get_send_comp");
+		return false;
+	}
+	assert(n == 1);
+
+	if (wc->status != IBV_WC_SUCCESS) {
+		fprintf(stderr, "Send request failed with %d\n", wc->status);
+		return false;
+	}
+	assert(wc->opcode == IBV_WC_SEND);
+	return true;
+}
+
+static bool rbt_get_recv_comp(rdma_cm_id_t *id, ibv_wc_t *wc)
+{
+	assert(id != NULL);
+	assert(wc != NULL);
+
+	int n = rdma_get_recv_comp(id, wc);
+	if (n < 0) {
+		perror("rdma_get_recv_comp");
+		return false;
+	}
+	assert(n == 1);
+
+	if (wc->status != IBV_WC_SUCCESS) {
+		fprintf(stderr, "Recv request failed with %d\n", wc->status);
+		return false;
+	}
+	assert(wc->opcode == IBV_WC_RECV);
+	return true;
+}
+
+
+static int rbt_get_fd_flags(int fd)
+{
+	int flags = fcntl(fd, F_GETFL);
+	if (flags < 0) perror("fcntl");
+	return flags;
+}
+
+static bool rbt_set_fd_flags(int fd, int flags)
+{
+	if (fcntl(fd, F_SETFL, flags) < 0) {
+		perror("fcntl");
+		return false;
+	}
+	return true;
+}
+
+static bool rbt_make_async(int fd)
+{
+	int flags = rbt_get_fd_flags(fd);
+	return (flags >= 0) ? rbt_set_fd_flags(fd, flags | O_NONBLOCK) : false;
+}
+
+static bool rbt_make_sync(int fd)
+{
+	int flags = rbt_get_fd_flags(fd);
+	return (flags >= 0) ? rbt_set_fd_flags(fd, flags & ~O_NONBLOCK) : false;
+}
+
+
+typedef struct ibv_cq ibv_cq_t;
+
+static bool rbt_req_notify(ibv_cq_t *cq)
+{
+	assert(cq != NULL);
+
+	if (rdma_seterrno(ibv_req_notify_cq(cq, 0)) < 0) {
+		perror("ibv_req_notify_cq");
+		return false;
+	}
+	return true;
+}
+
+static bool rbt_get_cq_event(rdma_cm_id_t *id, ibv_cq_t *id_cq, struct ibv_comp_channel *channel)
+{
+	ibv_cq_t *cq;
+	void *ctx;
+	if (ibv_get_cq_event(channel, &cq, &ctx) < 0) {
+		perror("ibv_get_cq_event");
+		return false;
+	}
+
+	assert(cq == id_cq);
+	(void)id_cq;
+	assert(ctx == id);
+	(void)id;
+	ibv_ack_cq_events(cq, 1);
+	return true;
+}
+
+static bool rbt_get_send_cq_event(rdma_cm_id_t *id)
+{
+	assert(id != NULL);
+	return rbt_get_cq_event(id, id->send_cq, id->send_cq_channel);
+}
+
+static bool rbt_get_recv_cq_event(rdma_cm_id_t *id)
+{
+	assert(id != NULL);
+	return rbt_get_cq_event(id, id->recv_cq, id->recv_cq_channel);
+}
+
+static int rbt_poll_cq(ibv_cq_t *cq, ibv_wc_t *wc)
+{
+	assert(cq != NULL);
+	assert(wc != NULL);
+
+	int n = ibv_poll_cq(cq, 1, wc);
+	if (n < 0) perror("ibv_poll_cq");
+	assert((n == 0) || (n == 1));
+	return n;
+}
+
+
+static rdma_cm_id_t *rbt_connect(const char *host, const char *port)
+{
+	assert(host != NULL);
+	assert(port != NULL);
+
+	struct rdma_addrinfo hints = { .ai_family = AF_INET, .ai_port_space = RDMA_PS_TCP }, *addr;
+	//NOTE: missing const has already been fixed in librdmacm
+	int err = rdma_getaddrinfo((char*)host, (char*)port, &hints, &addr);
+	if (err != 0) {
+		fprintf(stderr, "rdma_getaddrinfo(%s:%s): %s\n", host, port, gai_strerror(err));
+		return NULL;
+	}
+
+	struct ibv_qp_init_attr attr = {
+		.cap = { .max_send_wr = 1, .max_recv_wr = 1, .max_send_sge = 1, .max_recv_sge = 1 },
+		.sq_sig_all = 1
+	};
+
+	rdma_cm_id_t *id = NULL, *result = NULL;
+	if (rdma_create_ep(&id, addr, NULL, &attr) < 0) {
+		fprintf(stderr, "rdma_create_ep(%s:%s): %s\n", host, port, strerror(errno));
+		goto end;
+	}
+	if (rdma_connect(id, NULL) < 0) {
+		fprintf(stderr, "rdma_connect(%s:%s): %s\n", host, port, strerror(errno));
+		goto end;
+	}
+	result = id;
+
+end:
+	rdma_freeaddrinfo(addr);
+	if ((result == NULL) && (id != NULL)) rdma_destroy_ep(id);
+	return result;
+}
+
+void rbt_disconnect(rdma_cm_id_t *id)
+{
+	assert(id != NULL);
+	if (rdma_disconnect(id) < 0) perror("rdma_disconnect");
+	rdma_destroy_ep(id);
+}
+
+
+typedef struct rbt_cli_buf {
+	int fd;
+	void *addr;
+	ibv_mr_t *read_mr;
+	ibv_mr_t *write_mr;
+} rbt_cli_buf_t;
+
+#define rbt_cli_buf_initializer() (rbt_cli_buf_t){ .fd = -1 }
+
+static void rbt_cli_buf_destroy(rbt_cli_buf_t *buf)
+{
+	assert(buf != NULL);
+
+	if (buf->read_mr != NULL) rdma_dereg_mr(buf->read_mr);
+	if (buf->write_mr != NULL) rdma_dereg_mr(buf->write_mr);
+	if (buf->addr != NULL) munmap(buf->addr, buf_size * buf_nr);
+	if (buf->fd >= 0) close(buf->fd);
+	*buf = rbt_cli_buf_initializer();
+}
+
+typedef struct devpath devpath_t;
+
+static bool rbt_cli_buf_init(rbt_cli_buf_t *buf, devpath_t *dpp, int cpu, rdma_cm_id_t *id)
+{
+	assert(buf != NULL);
+	assert(dpp != NULL);
+	assert(cpu >= 0);
+	assert(id != NULL);
+
+	char ifn[MAXPATHLEN + 64];
+	snprintf(ifn, sizeof(ifn), "%s/block/%s/trace%d", debugfs_path, dpp->buts_name, cpu);
+
+	// Need to open relay file with write permissions to enable RDMA write of consumed sub-buffer count
+	if ((buf->fd = my_open(ifn, O_RDWR | O_NONBLOCK)) < 0) {
+		fprintf(stderr, "open(%s): %s\n", ifn, strerror(errno));
+		return false;
+	}
+
+	size_t length = buf_size * buf_nr;
+	buf->addr = my_mmap(NULL, length, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, buf->fd, 0);
+	if (buf->addr == MAP_FAILED) {
+		fprintf(stderr, "mmap(%s): %s\n", ifn, strerror(errno));
+		buf->addr = NULL;
+		goto error;
+	}
+
+	rblktrace_buf_header_t *header = buf->addr;
+	if (header->magic != RBLKTRACE_HEADER_MAGIC) {
+		fprintf(stderr, "Invalid relay buffer header magic: %zu\n", header->magic);
+		goto error;
+	}
+
+	int access = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ;
+	if ((buf->read_mr = ibv_reg_mr(id->pd, buf->addr, length, access)) == NULL) {
+		fprintf(stderr, "ibv_reg_mr(%s, %d): %s\n", ifn, access, strerror(errno));
+		goto error;
+	}
+	access |= IBV_ACCESS_REMOTE_WRITE;
+	if ((buf->write_mr = ibv_reg_mr(id->pd, buf->addr, sizeof(size_t), access)) == NULL) {
+		fprintf(stderr, "ibv_reg_mr(%s, %d): %s\n", ifn, access, strerror(errno));
+		goto error;
+	}
+	return true;
+
+error:
+	rbt_cli_buf_destroy(buf);
+	return false;
+}
+
+
+static void rbt_cli_dev_destroy(devpath_t *dpp, int last_cpu)
+{
+	assert(dpp != NULL);
+
+	if (dpp->rdma_bufs != NULL) {
+		for (int cpu = 0; cpu < last_cpu; cpu++) {
+			rbt_cli_buf_destroy(&(dpp->rdma_bufs[cpu]));
+		}
+		free(dpp->rdma_bufs);
+		dpp->rdma_bufs = NULL;
+	}
+}
+
+static bool rbt_cli_dev_init(devpath_t *dpp, rdma_cm_id_t *id)
+{
+	assert(dpp != NULL);
+
+	if ((dpp->rdma_bufs = my_malloc(max_cpus * sizeof(rbt_cli_buf_t))) == NULL) return false;
+
+	for (int cpu = 0; cpu < max_cpus; cpu++) {
+		rbt_cli_buf_t *buf = &(dpp->rdma_bufs[cpu]);
+		*buf = rbt_cli_buf_initializer();
+		if (!CPU_ISSET_S(cpu, CPU_ALLOC_SIZE(max_cpus), online_cpus)) continue;
+
+		if (!rbt_cli_buf_init(buf, dpp, cpu, id)) {
+			rbt_cli_dev_destroy(dpp, cpu);
+			return false;
+		}
+	}
+	return true;
+}
+
+
+typedef struct list_head list_head_t;
+
+static void rbt_cli_destroy(devpath_t *last_dpp)
+{
+	list_head_t *p;
+	__list_for_each(p, &devpaths) {
+		devpath_t *dpp = list_entry(p, devpath_t, head);
+		if (dpp == last_dpp) break;
+		rbt_cli_dev_destroy(dpp, max_cpus);
+	}
+}
+
+static bool rbt_cli_init(rdma_cm_id_t *id)
+{
+	list_head_t *p;
+	__list_for_each(p, &devpaths) {
+		devpath_t *dpp = list_entry(p, devpath_t, head);
+		if (!rbt_cli_dev_init(dpp, id)) {
+			rbt_cli_destroy(dpp);
+			return false;
+		}
+	}
+	return true;
+}
+
+
+// Synchronous request-response with fixed response length
+static bool rbt_send_recv(rdma_cm_id_t *id, void *req, size_t req_size, ibv_mr_t *req_mr,
+                          int req_flags, void *resp, size_t resp_size, ibv_mr_t *resp_mr)
+{
+	assert(id != NULL);
+	assert(req != NULL);
+	assert(resp != NULL);
+	assert(resp_mr != NULL);
+
+	if (!rbt_post_recv(id, NULL, resp, resp_size, resp_mr)) return false;
+	if (!rbt_post_send(id, NULL, req, req_size, req_mr, req_flags)) return false;
+
+	ibv_wc_t wc;
+	if (!rbt_get_send_comp(id, &wc)) return false;
+	if (!rbt_get_recv_comp(id, &wc)) return false;
+
+	if (wc.byte_len != resp_size) {
+		fprintf(stderr, "Invalid response length: %u != %zu\n", wc.byte_len, resp_size);
+		return false;
+	}
+	return true;
+}
+
+static bool check_magic(uint32_t magic)
+{
+	if (magic != BLK_IO_TRACE_MAGIC) fprintf(stderr, "Invalid magic value: %u\n", magic);
+	return magic == BLK_IO_TRACE_MAGIC;
+}
+
+
+static bool rbt_send_open(rdma_cm_id_t *id)
+{
+	assert(id != NULL);
+
+	size_t req_size = rbt_open_req_size(ndevs, max_cpus), resp_size = sizeof(rbt_open_resp_t);
+	ibv_mr_t *mr = rbt_msg_buf_create(id, req_size + resp_size);
+	if (mr == NULL) return false;
+	rbt_open_req_t *req = mr->addr;
+	rbt_open_resp_t *resp = mr->addr + req_size;
+
+	*req = (rbt_open_req_t){ BLK_IO_TRACE_MAGIC, ndevs, max_cpus, buf_size, buf_nr };
+	size_t i = 0;
+	list_head_t *p;
+	__list_for_each(p, &devpaths) {
+		devpath_t *dpp = list_entry(p, devpath_t, head);
+		rbt_dev_info_t *dev = rbt_dev_info_at(req, i);
+
+		strncpy(dev->buts_name, dpp->buts_name, sizeof(dev->buts_name));
+		dev->buts_name[sizeof(dev->buts_name) - 1] = '\0';
+
+		for (int cpu = 0; cpu < max_cpus; cpu++) {
+			rbt_cli_buf_t *buf = &(dpp->rdma_bufs[cpu]);
+			dev->bufs[cpu] = (rbt_buf_info_t){ buf->addr, buf->read_mr ? buf->read_mr->rkey : 0,
+			                                   buf->write_mr ? buf->write_mr->rkey : 0 };
+		}
+		i++;
+	}
+
+	bool result = false;
+	if (!rbt_send_recv(id, req, req_size, mr, 0, resp, sizeof(*resp), mr)) goto end;
+	if (!check_magic(resp->magic)) goto end;
+	if (!(result = resp->result)) fprintf(stderr, "Open request failed\n");
+
+end:
+	rbt_msg_buf_destroy(mr);
+	return result;
+}
+
+
+static bool rbt_send_close(rdma_cm_id_t *id)
+{
+	assert(id != NULL);
+
+	size_t req_size = rbt_close_req_size(ndevs), resp_size = rbt_close_resp_size(ndevs, max_cpus);
+	ibv_mr_t *mr = rbt_msg_buf_create(id, req_size + resp_size);
+	if (mr == NULL) return false;
+	rbt_close_req_t *req = mr->addr;;
+	rbt_close_resp_t *resp = mr->addr + req_size;
+
+	req->magic = BLK_IO_TRACE_MAGIC;
+	size_t i = 0;
+	list_head_t *p;
+	__list_for_each(p, &devpaths) {
+		devpath_t *dpp = list_entry(p, devpath_t, head);
+		req->drops[i++] = dpp->drops;
+	}
+
+	bool result = false;
+	if (!rbt_send_recv(id, req, req_size, mr, 0, resp, resp_size, mr)) goto end;
+	if (!check_magic(resp->magic)) goto end;
+
+	i = 0;
+	__list_for_each(p, &devpaths) {
+		devpath_t *dpp = list_entry(p, devpath_t, head);
+		for (int cpu = 0; cpu < max_cpus; cpu++) {
+			dpp->stats[cpu].data_read = *rbt_data_read_at(resp, max_cpus, i, cpu);
+		}
+		i++;
+	}
+	result = true;
+
+end:
+	rbt_msg_buf_destroy(mr);
+	return result;
+}
+
+
+static int net_client_rdma(void)
+{
+	printf("rblktrace: connecting to %s\n", hostname);
+	rdma_cm_id_t *id = rbt_connect(hostname, rdma_port);
+	if (id == NULL) return 1;
+
+	int result = 1;
+	if (setup_buts() != 0) goto end;
+	if (!rbt_cli_init(id)) goto end;
+	if (!rbt_send_open(id)) goto end;
+	start_buts();
+	printf("rblktrace: connected!\n");
+
+	if (stop_watch != 0) alarm(stop_watch);
+	//TODO: fix race condition with signal handler
+	while (!done) pause();
+
+	//NOTE: signal handler has already called stop_tracers()
+	//stop_tracers();
+	get_all_drops();
+	if (!rbt_send_close(id)) goto end;
+	show_stats(&devpaths);
+	result = 0;
+
+end:
+	rbt_cli_destroy(NULL);
+	rbt_disconnect(id);
+	return result;
+}
+
+
+typedef struct timespec timespec_t;
+
+static inline timespec_t get_time(void)
+{
+	timespec_t ts;
+	int status = clock_gettime(CLOCK_MONOTONIC, &ts);
+	assert(status == 0);
+	(void)status;
+	return ts;
+}
+
+static inline timespec_t time_diff(timespec_t t1, timespec_t t0)
+{
+	return (t1.tv_nsec >= t0.tv_nsec) ? (timespec_t){ t1.tv_sec - t0.tv_sec    , t1.tv_nsec - t0.tv_nsec              }
+	                                  : (timespec_t){ t1.tv_sec - t0.tv_sec - 1, t1.tv_nsec - t0.tv_nsec + 1000000000 };
+}
+
+static inline double time_to_msec(timespec_t t)
+{
+	return t.tv_sec * 1000.0 + t.tv_nsec / 1000000.0;
+}
+
+
+typedef enum rbt_buf_state {
+/* -<-*/no_data = 0,//<-------------
+// |	  |  ^                     |
+// |      v  |                     |
+/* |  */posted_header_read,//      |
+// |      |                        |
+// |      v                        |
+/* |  */new_data,//<-------------  |
+// |      |                     |  |
+// |      v                     |  |
+/* |  */posted_data_read,//     |  |
+// |      |                     |  |
+// |      v                     |  |
+/* |  */done_data_read,//       |  |
+// |      |                     |  |
+// |      v                     |  |
+/* |  */posted_header_write,//=>=---
+// |
+// |
+/* -->*/posted_last_header_read,
+//        |
+//        v
+/* -<-*/last_data,//<-----------------
+// |      |                          |
+// |      v                          |
+/* |  */posted_last_data_read,//     |
+// |      |                          |
+// |      v                          |
+/* |  */done_last_data_read,//       |
+// |      |                          |
+// |      v                          |
+/* |  */posted_last_header_write,//->-
+// |      |
+// |      v
+/* -->*/done_last_header_write
+} rbt_buf_state_t;
+
+
+typedef struct mmap_info mmap_info_t;
+
+typedef struct rbt_srv_buf {
+	int fd;
+	mmap_info_t mmap_info;
+	ibv_mr_t *mmap_mr;
+
+	void *remote_addr;
+	uint32_t read_rkey;
+	uint32_t write_rkey;
+
+	rbt_buf_state_t state;
+	bool pending;
+	ibv_mr_t *header_mr;
+	timespec_t timestamp;// last time header was read (taken at RDMA read completion)
+	rblktrace_buf_header_t header;// mirror of the relay buffer header on the client side
+} rbt_srv_buf_t;
+
+#define rbt_srv_buf_initializer() (rbt_srv_buf_t){ .fd = -1 }
+
+static inline size_t rbt_srv_buf_size(size_t buf_nr)
+{
+	return sizeof(rbt_srv_buf_t) + buf_nr * sizeof(size_t);
+}
+
+
+typedef struct rbt_srv_dev {
+	struct rbt_srv_cli_ctx *ctx;
+	devpath_t dp;
+	char data[];
+} rbt_srv_dev_t;
+
+static inline size_t rbt_srv_dev_size(size_t ncpus, size_t buf_nr)
+{
+	return sizeof(rbt_srv_dev_t) + ncpus * rbt_srv_buf_size(buf_nr);
+}
+
+
+typedef struct rbt_srv_cli_ctx {
+	list_head_t list_entry;
+
+	rdma_cm_id_t *id;//NOTE: not owned by this struct
+	time_t connect_time;
+	char *hostname;
+	ibv_mr_t *req_mr;// for close request
+
+	int ndevs;
+	int ncpus;
+	int buf_size;
+	int buf_nr;
+	list_head_t devpaths;
+
+	bool closing;
+} rbt_srv_cli_ctx_t;
+
+static const char *rbt_client_hostname(struct devpath *dpp)
+{
+	assert(dpp != NULL);
+	rbt_srv_dev_t *dev = container_of(dpp, rbt_srv_dev_t, dp);
+	return dev->ctx->hostname;
+}
+
+
+static void rbt_srv_buf_destroy(rbt_srv_buf_t *buf)
+{
+	assert(buf != NULL);
+
+	if (buf->header_mr != NULL) rdma_dereg_mr(buf->header_mr);
+	if (buf->mmap_mr != NULL) rdma_dereg_mr(buf->mmap_mr);
+	if (buf->mmap_info.fs_buf != NULL) munmap(buf->mmap_info.fs_buf, buf->mmap_info.fs_buf_len);
+	if (buf->fd >= 0) {
+		if (ftruncate(buf->fd, buf->mmap_info.fs_size) < 0) perror("ftruncate");
+		close(buf->fd);
+	}
+	*buf = rbt_srv_buf_initializer();
+}
+
+static bool rbt_srv_buf_init(rbt_srv_buf_t *buf, rbt_buf_info_t *info, rbt_srv_dev_t *dev, int cpu)
+{
+	assert(buf != NULL);
+	assert(info != NULL);
+	assert(dev != NULL);
+	assert(cpu >= 0);
+	*buf = rbt_srv_buf_initializer();
+
+	char hostdir[MAXPATHLEN + 64];
+	int len = snprintf(hostdir, sizeof(hostdir), "%s-", dev->ctx->hostname);
+	len += strftime(hostdir + len, sizeof(hostdir) - len, "%F-%T/", gmtime(&(dev->ctx->connect_time)));
+	char ofn[MAXPATHLEN + 64];
+	if (fill_ofname(ofn, sizeof(ofn), hostdir, dev->dp.buts_name, cpu) != 0) goto error;
+
+	if ((buf->fd = my_open3(ofn, O_RDWR | O_CREAT, 0644)) < 0) {
+		fprintf(stderr, "Open output file %s failed: %d/%s\n", ofn, errno, strerror(errno));
+		goto error;
+	}
+	buf->mmap_info = (mmap_info_t){ .buf_size = dev->ctx->buf_size, .buf_nr = dev->ctx->buf_nr, .pagesize = pagesize };
+
+	buf->remote_addr = info->addr;
+	buf->read_rkey = info->read_rkey;
+	buf->write_rkey = info->write_rkey;
+
+	// Ignore non-existent buffers/CPUs
+	if (buf->remote_addr == NULL) buf->state = done_last_header_write;
+
+	buf->header_mr = rbt_reg_msgs(dev->ctx->id, &(buf->header), rblktrace_buf_header_size(dev->ctx->buf_nr));
+	if (buf->header_mr == NULL) goto error;
+
+	buf->timestamp = get_time();
+	return true;
+
+error:
+	rbt_srv_buf_destroy(buf);
+	return false;
+}
+
+
+static inline rbt_srv_buf_t *rbt_srv_buf_at(rbt_srv_dev_t *dev, size_t idx)
+{
+	assert(dev != NULL);
+	return (rbt_srv_buf_t*)(dev->data + idx * rbt_srv_buf_size(dev->ctx->buf_nr));
+}
+
+static void rbt_srv_dev_destroy(rbt_srv_dev_t *dev, int last_cpu)
+{
+	assert(dev != NULL);
+
+	if (dev->dp.buts_name != NULL) free(dev->dp.buts_name);
+	if (dev->dp.stats != NULL) free(dev->dp.stats);
+
+	for (int cpu = 0; cpu < last_cpu; cpu++) {
+		rbt_srv_buf_t *buf = rbt_srv_buf_at(dev, cpu);
+		rbt_srv_buf_destroy(buf);
+	}
+	free(dev);
+}
+
+static rbt_srv_dev_t *rbt_srv_dev_create(rbt_dev_info_t *info, rbt_srv_cli_ctx_t *ctx)
+{
+	assert(info != NULL);
+	assert(ctx != NULL);
+
+	rbt_srv_dev_t *dev = my_malloc(rbt_srv_dev_size(ctx->ncpus, ctx->buf_nr));
+	if (dev == NULL) return NULL;
+
+	dev->ctx = ctx;
+	dev->dp = (devpath_t){ .fd = -1, .ncpus = ctx->ncpus };
+	if ((dev->dp.buts_name = my_strdup(info->buts_name)) == NULL) goto error;
+	if ((dev->dp.stats = my_calloc(ctx->ncpus * sizeof(struct pdc_stats))) == NULL) goto error;
+
+	for (int cpu = 0; cpu < ctx->ncpus; cpu++) {
+		rbt_srv_buf_t *buf = rbt_srv_buf_at(dev, cpu);
+		if (!rbt_srv_buf_init(buf, &(info->bufs[cpu]), dev, cpu)) {
+			rbt_srv_dev_destroy(dev, cpu);
+			return NULL;
+		}
+	}
+	return dev;
+
+error:
+	rbt_srv_dev_destroy(dev, 0);
+	return NULL;
+}
+
+
+static void rbt_srv_cli_ctx_destroy(rbt_srv_cli_ctx_t *ctx)
+{
+	assert(ctx != NULL);
+
+	if (ctx->hostname != NULL) free(ctx->hostname);
+	if (ctx->req_mr != NULL) rbt_msg_buf_destroy(ctx->req_mr);
+
+	list_head_t *p, *q;
+	list_for_each_safe(p, q, &(ctx->devpaths)) {
+		list_del(p);
+		devpath_t *dpp = list_entry(p, devpath_t, head);
+		rbt_srv_dev_t *dev = container_of(dpp, rbt_srv_dev_t, dp);
+		rbt_srv_dev_destroy(dev, ctx->ncpus);
+	}
+	free(ctx);
+}
+
+static rbt_srv_cli_ctx_t *rbt_srv_cli_ctx_create(rdma_cm_id_t *id, rbt_open_req_t *req)
+{
+	assert(id != NULL);
+	assert(req != NULL);
+
+	rbt_srv_cli_ctx_t *ctx = my_malloc(sizeof(rbt_srv_cli_ctx_t));
+	if (ctx == NULL) return NULL;
+
+	*ctx = (rbt_srv_cli_ctx_t){ .id = id, .ndevs = req->ndevs, .ncpus = req->ncpus,
+	                            .buf_size = req->buf_size, .buf_nr = req->buf_nr };
+	time(&ctx->connect_time);
+	INIT_LIST_HEAD(&(ctx->devpaths));
+
+	struct sockaddr *addr = rdma_get_peer_addr(id);
+	assert(addr != NULL);
+	assert(addr->sa_family == AF_INET);
+	if ((ctx->hostname = strdup(inet_ntoa(((struct sockaddr_in*)addr)->sin_addr))) == NULL) goto error;
+
+	if ((ctx->req_mr = rbt_msg_buf_create(id, rbt_close_req_size(req->ndevs))) == NULL) goto error;
+
+	for (int i = 0; i < req->ndevs; i++) {
+		rbt_srv_dev_t *dev = rbt_srv_dev_create(rbt_dev_info_at(req, i), ctx);
+		if (dev == NULL) goto error;
+		list_add_tail(&(dev->dp.head), &(ctx->devpaths));
+	}
+
+	if (!rbt_make_async(id->recv_cq_channel->fd)) goto error;
+	if (!rbt_req_notify(id->recv_cq)) goto error;
+	if (!rbt_post_recv(id, NULL, ctx->req_mr->addr, rbt_close_req_size(req->ndevs), ctx->req_mr)) goto error;
+
+	return ctx;
+
+error:
+	rbt_srv_cli_ctx_destroy(ctx);
+	return NULL;
+}
+
+
+static rdma_cm_id_t *rbt_listen(const char *port, int backlog)
+{
+	assert(port != NULL);
+
+	struct rdma_addrinfo hints = { .ai_flags = RAI_PASSIVE, .ai_family = AF_INET, .ai_port_space = RDMA_PS_TCP }, *addr;
+	//NOTE: missing const fixed in newer version of librdmacm
+	int err = rdma_getaddrinfo((char*)"0.0.0.0", (char*)port, &hints, &addr);
+	if (err != 0) {
+		fprintf(stderr, "rdma_getaddrinfo: %s\n", gai_strerror(err));
+		return NULL;
+	}
+
+	struct ibv_qp_init_attr attr = {
+		.cap = {
+			.max_send_wr = max_ndevs * max_ncpus,// header read or data read or header write, per buffer
+			.max_recv_wr = 1,// open or close request
+			.max_send_sge = 1, .max_recv_sge = 1,
+			.max_inline_data = max(sizeof(rbt_close_resp_t), sizeof(size_t)/*consumed sub-buffer count*/)
+		},
+		.sq_sig_all = 1
+	};
+
+	rdma_cm_id_t *id = NULL, *result = NULL;
+	if (rdma_create_ep(&id, addr, NULL, &attr) < 0) {
+		perror("rdma_create_ep");
+		goto end;
+	}
+	if (rdma_listen(id, backlog) < 0) {
+		perror("rdma_listen");
+		goto end;
+	}
+	result = id;
+
+end:
+	rdma_freeaddrinfo(addr);
+	if ((result == NULL) && (id != NULL)) rdma_destroy_ep(id);
+	return result;
+}
+
+
+typedef struct pollfd pollfd_t;
+
+typedef struct rbt_srv {
+	rdma_cm_id_t *id;
+	pollfd_t *pfds;
+	nfds_t nfds;
+	list_head_t clients;
+} rbt_srv_t;
+
+static void rbt_srv_destroy(rbt_srv_t *srv)
+{
+	assert(srv != NULL);
+
+	if (srv->id != NULL) rdma_destroy_ep(srv->id);
+	if (srv->pfds != NULL) free(srv->pfds);
+
+	list_head_t *p, *q;
+	list_for_each_safe(p, q, &(srv->clients)) {
+		list_del(p);
+		rbt_srv_cli_ctx_t *ctx = list_entry(p, rbt_srv_cli_ctx_t, list_entry);
+		rdma_cm_id_t *id = ctx->id;
+		rbt_srv_cli_ctx_destroy(ctx);
+		if (id != NULL) rbt_disconnect(id);
+	}
+	free(srv);
+}
+
+static rbt_srv_t *rbt_srv_create(void)
+{
+	rbt_srv_t *srv = my_calloc(sizeof(rbt_srv_t));
+	if (srv == NULL) return NULL;
+
+	INIT_LIST_HEAD(&(srv->clients));
+	if ((srv->id = rbt_listen(rdma_port, 1)) == NULL) goto error;
+	if ((srv->pfds = my_malloc(sizeof(pollfd_t))) == NULL) goto error;
+
+	srv->nfds = 1;
+	srv->pfds[0] = (pollfd_t){ srv->id->channel->fd, POLLIN, 0 };
+	return srv;
+
+error:
+	rbt_srv_destroy(srv);
+	return NULL;
+}
+
+
+static bool rbt_send_open_resp(rdma_cm_id_t *id, bool status)
+{
+	assert(id != NULL);
+
+	rbt_open_resp_t resp = { BLK_IO_TRACE_MAGIC, status };
+	if (!rbt_post_send(id, NULL, &resp, sizeof(resp), NULL, IBV_SEND_INLINE)) return false;
+
+	ibv_wc_t wc;
+	return rbt_get_send_comp(id, &wc);
+}
+
+static bool rbt_handle_open_req(rbt_srv_t *srv, rdma_cm_id_t *id, rbt_open_req_t *req, ibv_wc_t *wc)
+{
+	assert(srv != NULL);
+	assert(id != NULL);
+	assert(req != NULL);
+	assert(wc != NULL);
+
+	bool sent_resp = false;
+	rbt_srv_cli_ctx_t *ctx = NULL;
+	if (wc->byte_len < sizeof(rbt_open_req_t)) {
+		fprintf(stderr, "Invalid open request length: %u < %zu\n", wc->byte_len, sizeof(rbt_open_req_t));
+		goto error;
+	}
+	if (!check_magic(req->magic)) goto error;
+
+	size_t req_size = rbt_open_req_size(req->ndevs, req->ncpus);
+	if (wc->byte_len != req_size) {
+		fprintf(stderr, "Invalid open request length: %u != %zu\n", wc->byte_len, req_size);
+		goto error;
+	}
+
+	if ((ctx = rbt_srv_cli_ctx_create(id, req)) == NULL) goto error;
+
+	pollfd_t *pfds = my_realloc(srv->pfds, (srv->nfds + 2) * sizeof(pollfd_t));
+	if (pfds == NULL) goto error;
+	srv->pfds = pfds;
+	pfds[srv->nfds++] = (pollfd_t){ id->send_cq_channel->fd, POLLIN, 0 };
+	pfds[srv->nfds++] = (pollfd_t){ id->recv_cq_channel->fd, POLLIN, 0 };
+
+	sent_resp = true;
+	if (!rbt_send_open_resp(id, true)) goto error;
+
+	if (!rbt_make_async(id->send_cq_channel->fd)) goto error;
+	if (!rbt_req_notify(id->send_cq)) goto error;
+
+	list_add_tail(&(ctx->list_entry), &(srv->clients));
+	printf("rdma server: connection from %s\n", ctx->hostname);
+	return true;
+
+error:
+	if (!sent_resp) {
+		srv->nfds -= 2;
+		rbt_send_open_resp(id, false);
+	}
+	if (ctx != NULL) rbt_srv_cli_ctx_destroy(ctx);
+	return false;
+}
+
+
+static bool rbt_accept(rbt_srv_t *srv)
+{
+	assert(srv != NULL);
+
+	rdma_cm_id_t *id;
+	if (rdma_get_request(srv->id, &id) < 0) {
+		perror("rdma_get_request");
+		return false;
+	}
+
+	bool result = false, accepted = false;
+	size_t req_size = rbt_open_req_size(max_ndevs, max_ncpus);
+	ibv_mr_t *req_mr = rbt_msg_buf_create(id, req_size);
+	if (req_mr == NULL) goto end;
+	rbt_open_req_t *req = req_mr->addr;
+
+	if (!rbt_post_recv(id, NULL, req, req_size, req_mr)) goto end;
+
+	if (rdma_accept(id, NULL) < 0) {
+		perror("rdma_accept");
+		goto end;
+	}
+	accepted = true;
+
+	ibv_wc_t wc;
+	if (!rbt_get_recv_comp(id, &wc)) goto end;
+
+	result = rbt_handle_open_req(srv, id, req, &wc);
+
+end:
+	if (req_mr != NULL) rbt_msg_buf_destroy(req_mr);
+	if (!result) {
+		accepted ? rdma_disconnect(id) : rdma_reject(id, NULL, 0);
+		rdma_destroy_ep(id);
+	}
+	return result;
+}
+
+
+typedef enum rbt_op {
+	rbt_op_header_read,
+	rbt_op_data_read,
+	rbt_op_header_write
+} rbt_op_t;
+
+typedef struct rbt_comp_ctx {
+	rbt_srv_dev_t *dev;
+	int cpu;
+	rbt_op_t op;
+} rbt_comp_ctx_t;
+
+static rbt_comp_ctx_t *rbt_comp_ctx_create(rbt_srv_dev_t *dev, int cpu, rbt_op_t op)
+{
+	rbt_comp_ctx_t *ctx = my_malloc(sizeof(rbt_comp_ctx_t));
+	if (ctx != NULL) *ctx = (rbt_comp_ctx_t){ dev, cpu, op };
+	return ctx;
+}
+
+
+static bool rbt_post_header_read(rbt_srv_dev_t *dev, int cpu)
+{
+	rbt_srv_buf_t *buf = rbt_srv_buf_at(dev, cpu);
+
+	rbt_comp_ctx_t *comp = rbt_comp_ctx_create(dev, cpu, rbt_op_header_read);
+	if (comp == NULL) return false;
+
+	if (rdma_post_read(dev->ctx->id, comp, (void*)&(buf->header.magic),
+	                   rblktrace_buf_header_size(dev->ctx->buf_nr) - sizeof(size_t),
+	                   buf->header_mr, 0, (uint64_t)buf->remote_addr + sizeof(size_t), buf->read_rkey) < 0) {
+		perror("rdma_post_read");
+		free(comp);
+		return false;
+	}
+
+	assert(!buf->pending);
+	buf->pending = true;
+	buf->state = !dev->ctx->closing ? posted_header_read : posted_last_header_read;
+	return true;
+}
+
+static bool rbt_header_read_comp(rbt_srv_dev_t *dev, int cpu)
+{
+	rbt_srv_buf_t *buf = rbt_srv_buf_at(dev, cpu);
+	assert((buf->state == posted_header_read) || (buf->state == posted_last_header_read));
+	assert(buf->pending);
+	buf->timestamp = get_time();
+
+	if (buf->header.magic != RBLKTRACE_HEADER_MAGIC) {
+		fprintf(stderr, "Invalid relay buffer header magic: %zu\n", buf->header.magic);
+		return false;
+	}
+	if (buf->header.produced < buf->header.consumed) {
+		fprintf(stderr, "Invalid sub-buffer counts: produced %zu < consumed %zu\n",
+		        buf->header.produced, buf->header.consumed);
+		return false;
+	}
+
+	bool has_data = false;
+	if (buf->header.produced > buf->header.consumed) {
+		size_t subbuf_idx = buf->header.consumed % dev->ctx->buf_nr;
+		size_t padding = buf->header.padding[subbuf_idx];
+		size_t subbuf_size = dev->ctx->buf_size;
+
+		if (padding > subbuf_size) {
+			fprintf(stderr, "Invalid sub-buffer %zu padding: %zu > %zu\n", subbuf_idx, padding, subbuf_size);
+			return false;
+		}
+		has_data = (subbuf_idx != 0) || (padding < subbuf_size - rblktrace_buf_header_size(dev->ctx->buf_nr));
+	}
+
+	buf->state = (buf->state == posted_header_read) ? (has_data ? new_data : no_data)
+	                                                : (has_data ? last_data : done_last_header_write);
+	buf->pending = false;
+	return true;
+}
+
+
+static bool rbt_setup_mmap(rbt_srv_buf_t *buf, unsigned int maxlen, rbt_srv_cli_ctx_t *ctx)
+{
+	assert(buf != NULL);
+	assert(ctx != NULL);
+
+	mmap_info_t *mip = &(buf->mmap_info);
+	if ((buf->mmap_mr != NULL) && (mip->fs_off + maxlen > mip->fs_buf_len)) {
+		rdma_dereg_mr(buf->mmap_mr);
+		buf->mmap_mr = NULL;
+	}
+
+	if (setup_mmap(buf->fd, maxlen, mip, NULL) != 0) return false;
+	return (buf->mmap_mr = rbt_reg_msgs(ctx->id, mip->fs_buf, mip->fs_buf_len)) != NULL;
+}
+
+static bool rbt_post_data_read(rbt_srv_dev_t *dev, int cpu)
+{
+	rbt_srv_buf_t *buf = rbt_srv_buf_at(dev, cpu);
+	assert((buf->state == new_data) || (buf->state == last_data));
+	assert(!buf->pending);
+
+	size_t subbuf_idx = buf->header.consumed % dev->ctx->buf_nr;
+	assert(buf->header.padding[subbuf_idx] <= (size_t)dev->ctx->buf_size);
+
+	size_t offset = subbuf_idx * dev->ctx->buf_size;
+	size_t length = dev->ctx->buf_size - buf->header.padding[subbuf_idx];
+	if (subbuf_idx == 0) {
+		offset += rblktrace_buf_header_size(dev->ctx->buf_nr);
+		length -= rblktrace_buf_header_size(dev->ctx->buf_nr);
+	}
+	if (!rbt_setup_mmap(buf, length, dev->ctx)) return false;
+
+	rbt_comp_ctx_t *comp = rbt_comp_ctx_create(dev, cpu, rbt_op_data_read);
+	if (comp == NULL) return false;
+
+	void *local_addr = buf->mmap_info.fs_buf + buf->mmap_info.fs_off;
+	uint64_t remote_addr = (uint64_t)buf->remote_addr + offset;
+	if (rdma_post_read(dev->ctx->id, comp, local_addr, length, buf->mmap_mr, 0, remote_addr, buf->read_rkey) < 0) {
+		perror("rdma_post_read");
+		free(comp);
+		return false;
+	}
+
+	buf->state = (buf->state == new_data) ? posted_data_read : posted_last_data_read;
+	buf->pending = true;
+	return true;
+}
+
+static bool rbt_data_read_comp(rbt_srv_dev_t *dev, int cpu, ibv_wc_t *wc)
+{
+	assert(wc != NULL);
+
+	rbt_srv_buf_t *buf = rbt_srv_buf_at(dev, cpu);
+	assert((buf->state == posted_data_read) || (buf->state == posted_last_data_read));
+	assert(buf->pending);
+
+	buf->mmap_info.fs_off += wc->byte_len;
+	buf->mmap_info.fs_size += wc->byte_len;
+	dev->dp.stats[cpu].data_read += wc->byte_len;
+	buf->header.consumed++;
+
+	buf->state = (buf->state == posted_data_read) ? done_data_read : done_last_data_read;
+	buf->pending = false;
+	return true;
+}
+
+
+static bool rbt_post_header_write(rbt_srv_dev_t *dev, int cpu)
+{
+	rbt_srv_buf_t *buf = rbt_srv_buf_at(dev, cpu);
+	assert((buf->state == done_data_read) || (buf->state == done_last_data_read));
+	assert(!buf->pending);
+
+	rbt_comp_ctx_t *comp = rbt_comp_ctx_create(dev, cpu, rbt_op_header_write);
+	if (comp == NULL) return false;
+
+	if (rdma_post_write(dev->ctx->id, comp, (void*)&(buf->header.consumed), sizeof(size_t), NULL,
+	                    IBV_SEND_INLINE, (uint64_t)buf->remote_addr, buf->write_rkey) < 0) {
+		perror("rdma_post_write");
+		free(comp);
+		return false;
+	}
+
+	buf->state = (buf->state == done_data_read) ? posted_header_write : posted_last_header_write;
+	buf->pending = true;
+	return true;
+}
+
+static bool rbt_header_write_comp(rbt_srv_dev_t *dev, int cpu)
+{
+	rbt_srv_buf_t *buf = rbt_srv_buf_at(dev, cpu);
+	assert((buf->state == posted_header_write) || (buf->state == posted_last_header_write));
+	assert(buf->pending);
+
+	if (buf->header.produced > buf->header.consumed) {
+		buf->state = (buf->state == posted_header_write) ? new_data : last_data;
+	} else {
+		buf->state = (buf->state == posted_header_write) ? no_data : done_last_header_write;
+	}
+
+	buf->pending = false;
+	return true;
+}
+
+
+static bool rbt_handle_comp(ibv_wc_t *wc)
+{
+	assert(wc != NULL);
+
+	rbt_comp_ctx_t *comp = (rbt_comp_ctx_t*)wc->wr_id;
+	assert(comp != NULL);
+	bool result = false;
+
+	if (wc->status != IBV_WC_SUCCESS) {
+		fprintf(stderr, "Send request failed with %d\n", wc->status);
+		goto end;
+	}
+
+	switch (comp->op) {
+		case rbt_op_header_read: result = rbt_header_read_comp(comp->dev, comp->cpu); break;
+		case rbt_op_data_read: result = rbt_data_read_comp(comp->dev, comp->cpu, wc); break;
+		case rbt_op_header_write: result = rbt_header_write_comp(comp->dev, comp->cpu); break;
+		default: assert(false);
+	}
+
+end:
+	free(comp);
+	return result;
+}
+
+static bool rbt_handle_send_comps(rbt_srv_cli_ctx_t *ctx)
+{
+	assert(ctx != NULL);
+
+	if (!rbt_get_send_cq_event(ctx->id)) return false;
+	if (!rbt_req_notify(ctx->id->send_cq)) return false;
+
+	for (;;) {
+		ibv_wc_t wc;
+		int n = rbt_poll_cq(ctx->id->send_cq, &wc);
+		if (n < 0) return false;
+		if (n == 0) break;
+		if (!rbt_handle_comp(&wc)) return false;
+	}
+	return true;
+}
+
+
+static bool rbt_handle_close_req(rbt_srv_cli_ctx_t *ctx, ibv_wc_t *wc)
+{
+	assert(ctx != NULL);
+	assert(wc != NULL);
+
+	if (wc->byte_len < sizeof(rbt_close_req_t)) {
+		fprintf(stderr, "Invalid close request length: %u < %zu\n", wc->byte_len, sizeof(rbt_close_req_t));
+		return false;
+	}
+
+	rbt_close_req_t *req = ctx->req_mr->addr;
+	if (!check_magic(req->magic)) return false;
+
+	size_t req_size = rbt_close_req_size(ctx->ndevs);
+	if (wc->byte_len != req_size) {
+		fprintf(stderr, "Invalid close request length: %u != %zu\n", wc->byte_len, req_size);
+		return false;
+	}
+
+	list_head_t *p;
+	size_t i = 0;
+	__list_for_each(p, &(ctx->devpaths)) {
+		devpath_t *dpp = list_entry(p, devpath_t, head);
+		dpp->drops = req->drops[i++];
+	}
+
+	ctx->closing = true;
+	return true;
+}
+
+static bool rbt_send_close_resp(rbt_srv_cli_ctx_t *ctx)
+{
+	assert(ctx != NULL);
+
+	size_t resp_size = rbt_close_resp_size(ctx->ndevs, ctx->ncpus);
+	ibv_mr_t *resp_mr = rbt_msg_buf_create(ctx->id, resp_size);
+	if (resp_mr == NULL) return false;
+	rbt_close_resp_t *resp = resp_mr->addr;
+	resp->magic = BLK_IO_TRACE_MAGIC;
+
+	list_head_t *p;
+	size_t i = 0;
+	__list_for_each(p, &(ctx->devpaths)) {
+		devpath_t *dpp = list_entry(p, devpath_t, head);
+		for (int cpu = 0; cpu < ctx->ncpus; cpu++) {
+			*rbt_data_read_at(resp, ctx->ncpus, i, cpu) = dpp->stats[cpu].data_read;
+		}
+		i++;
+	}
+
+	bool result = false;
+	if (!rbt_post_send(ctx->id, NULL, resp, resp_size, resp_mr, 0)) goto end;
+
+	ibv_wc_t wc;
+	if (!rbt_get_send_comp(ctx->id, &wc)) goto end;
+	result = true;
+
+end:
+	rbt_msg_buf_destroy(resp_mr);
+	return result;
+}
+
+
+static bool rbt_handle_recv_comps(rbt_srv_cli_ctx_t *ctx)
+{
+	assert(ctx != NULL);
+
+	if (!rbt_get_recv_cq_event(ctx->id)) return false;
+	//NOTE: no need to request more completion events, this is the last recv request posted
+
+	ibv_wc_t wc;
+	int n = rbt_poll_cq(ctx->id->recv_cq, &wc);
+	if (n == 0) fprintf(stderr, "No recv completions\n");
+	if (n <= 0) return false;
+
+	if (!rbt_make_sync(ctx->id->send_cq_channel->fd)) return false;
+	if (!rbt_make_sync(ctx->id->recv_cq_channel->fd)) return false;
+	return rbt_handle_close_req(ctx, &wc);
+}
+
+
+static bool rbt_handle_buffer(rbt_srv_dev_t *dev, int cpu)
+{
+	rbt_srv_buf_t *buf = rbt_srv_buf_at(dev, cpu);
+
+	switch (buf->state) {
+	case no_data:
+		if (dev->ctx->closing || (time_to_msec(time_diff(get_time(), buf->timestamp)) >= (double)rdma_interval)) {
+			return rbt_post_header_read(dev, cpu);
+		}
+		assert(!buf->pending);
+		return true;
+
+	case posted_header_read:
+		assert(buf->pending);
+		return true;
+
+	case new_data:
+		return rbt_post_data_read(dev, cpu);
+
+	case posted_data_read:
+		assert(buf->pending);
+		return true;
+
+	case done_data_read:
+		return rbt_post_header_write(dev, cpu);
+
+	case posted_header_write:
+		assert(buf->pending);
+		return true;
+
+	case posted_last_header_read:
+		assert(buf->pending);
+		return true;
+
+	case last_data:
+		return rbt_post_data_read(dev, cpu);
+
+	case posted_last_data_read:
+		assert(buf->pending);
+		return true;
+
+	case done_last_data_read:
+		return rbt_post_header_write(dev, cpu);
+
+	case posted_last_header_write:
+		assert(buf->pending);
+		return true;
+
+	case done_last_header_write:
+		assert(!buf->pending);
+		return true;
+
+	default:
+		assert(false);
+		return false;
+	}
+}
+
+
+// Returns false on failure or if close response has been sent to the client
+static bool rbt_handle_client(rbt_srv_cli_ctx_t *ctx)
+{
+	assert(ctx != NULL);
+
+	int done = 0;
+	list_head_t *p;
+	__list_for_each(p, &(ctx->devpaths)) {
+		devpath_t *dpp = list_entry(p, devpath_t, head);
+		rbt_srv_dev_t *dev = container_of(dpp, rbt_srv_dev_t, dp);
+
+		for (int cpu = 0; cpu < ctx->ncpus; cpu++) {
+			if (!rbt_handle_buffer(dev, cpu)) return false;
+			if (rbt_srv_buf_at(dev, cpu)->state == done_last_header_write) done++;
+		}
+	}
+
+	if (done == ctx->ndevs * ctx->ncpus) {
+		show_stats(&(ctx->devpaths));
+		rbt_send_close_resp(ctx);
+		return false;
+	}
+	return true;
+}
+
+static void rbt_remove_client(rbt_srv_t *srv, rbt_srv_cli_ctx_t *ctx, size_t pfd_idx)
+{
+	assert(srv != NULL);
+	assert(ctx != NULL);
+	assert(pfd_idx < srv->nfds);
+	assert(pfd_idx % 2 == 1);
+
+	list_del(&(ctx->list_entry));
+	rdma_cm_id_t *id = ctx->id;
+	rbt_srv_cli_ctx_destroy(ctx);
+	if (id != NULL) rbt_disconnect(id);
+	if (pfd_idx < srv->nfds - 2) memmove(&(srv->pfds[pfd_idx]), &(srv->pfds[pfd_idx + 2]), srv->nfds - pfd_idx - 2);
+	srv->nfds -= 2;
+}
+
+
+static int net_server_rdma(void)
+{
+	rbt_srv_t *srv = rbt_srv_create();
+	if (srv == NULL) return 1;
+	printf("rdma server: waiting for connections...\n");
+
+	int result = 0;
+	while (!done) {
+		//TODO: fix race condition with signal handler
+		int events = poll(srv->pfds, srv->nfds, (srv->nfds > 1) ? rdma_interval : -1);
+		if ((events < 0) && (errno != EINTR)) {
+			perror("poll");
+			result = 1;
+			break;
+		}
+
+		if ((events > 0) && (srv->pfds[0].revents & POLLIN)) rbt_accept(srv);
+
+		list_head_t *p, *q;
+		size_t i = 1;
+		list_for_each_safe(p, q, &(srv->clients)) {
+			rbt_srv_cli_ctx_t *ctx = list_entry(p, rbt_srv_cli_ctx_t, list_entry);
+
+			if ((events > 0) && (srv->pfds[i].revents & POLLIN)) {
+				events--;
+				if (!rbt_handle_send_comps(ctx)) {
+					rbt_remove_client(srv, ctx, i);
+					continue;
+				}
+			}
+
+			if ((events > 0) && (srv->pfds[i + 1].revents & POLLIN)) {
+				events--;
+				if (!rbt_handle_recv_comps(ctx)) {
+					rbt_remove_client(srv, ctx, i);
+					continue;
+				}
+				srv->pfds[i + 1] = (pollfd_t){ -1, 0, 0 };
+			}
+
+			if (!rbt_handle_client(ctx)) {
+				rbt_remove_client(srv, ctx, i);
+				continue;
+			}
+			i += 2;
+		}
+	}
+
+	rbt_srv_destroy(srv);
+	return result;
+}
+
+
+#endif// RBLKTRACE

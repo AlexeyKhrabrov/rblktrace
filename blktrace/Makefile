@@ -1,7 +1,7 @@
 CC	= gcc
-CFLAGS	= -Wall -O2 -g -W
+CFLAGS	= -Wall -O2 -g -Wextra -Werror -DCONFIG_RBLKTRACE #-DNDEBUG
 ALL_CFLAGS = $(CFLAGS) -D_GNU_SOURCE -D_LARGEFILE_SOURCE -D_FILE_OFFSET_BITS=64
-PROGS	= blkparse blktrace verify_blkparse blkrawverify blkiomon
+PROGS	= blkparse blktrace verify_blkparse blkrawverify blkiomon rblktrace
 LIBS	= -lpthread
 SCRIPTS	= btrace
 SUBDIRS = btreplay btt iowatcher
@@ -36,6 +36,12 @@ blkrawverify: blkrawverify.o
 blkiomon: blkiomon.o rbtree.o
 	$(CC) $(ALL_CFLAGS) $(LDFLAGS) -o $@ $(filter %.o,$^) $(LIBS) -lrt
 
+rblktrace.o: blktrace.c
+	$(CC) -o $*.o -c $(ALL_CFLAGS) -DRBLKTRACE $<
+
+rblktrace: rblktrace.o act_mask.o
+	$(CC) $(ALL_CFLAGS) -DRBLKTRACE $(LDFLAGS) -o $@ $(filter %.o,$^) -lrdmacm -libverbs $(LIBS)
+
 $(PROGS): | depend
 
 docs:
@@ -52,7 +58,7 @@ depend:
 	@$(CC) -MM $(ALL_CFLAGS) *.c 1> .depend
 
 INSTALL = install
-prefix = /usr/local
+prefix ?= /usr/local
 bindir = $(prefix)/bin
 mandir = $(prefix)/man
 RPMBUILD = rpmbuild

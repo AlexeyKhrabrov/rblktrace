@@ -413,6 +413,70 @@ static struct rchan_callbacks blk_relay_callbacks = {
 	.remove_buf_file	= blk_remove_buf_file_callback,
 };
 
+
+#ifdef CONFIG_RBLKTRACE
+
+static int rblktrace_subbuf_start(struct rchan_buf *buf, void *subbuf, void *prev_subbuf, size_t prev_padding)
+{
+	rblktrace_buf_header_t *header = buf->start;
+
+	if (prev_subbuf != NULL) {
+		// Update the previous sub-buffer padding for the remote reader
+		size_t idx = (prev_subbuf - buf->start) / buf->chan->subbuf_size;
+		header->padding[idx] = prev_padding;
+	} else {
+		// Initialize buffer header
+		memset(header, 0, rblktrace_buf_header_size(buf->chan->n_subbufs));
+		header->magic = RBLKTRACE_HEADER_MAGIC;
+	}
+
+	//NOTE: need a write barrier so that the padding is updated before the produced sub-buffer count
+	// (otherwise, the remote reader might see a stale padding value and read an incorrect amount of data)
+	wmb();
+	// Update produced sub-buffer count for the remote reader
+	header->produced = buf->subbufs_produced;
+
+	// Consume remotely read sub-buffers
+	size_t consumed = header->consumed;
+	if (consumed > buf->subbufs_consumed) {
+		//NOTE: this function handles potentially invalid consumed sub-buffer count
+		relay_subbufs_consumed(buf->chan, buf->cpu, consumed - buf->subbufs_consumed);
+	}
+
+	if (relay_buf_full(buf)) return 0;
+
+	// Reserve space for the buffer header in the first sub-buffer
+	if (subbuf == buf->start) {
+		subbuf_start_reserve(buf, rblktrace_buf_header_size(buf->chan->n_subbufs));
+	}
+	return 1;
+}
+
+static int blk_subbuf_start_callback_rdma(struct rchan_buf *buf, void *subbuf, void *prev_subbuf, size_t prev_padding)
+{
+	if (rblktrace_subbuf_start(buf, subbuf, prev_subbuf, prev_padding)) return 1;
+
+	struct blk_trace *bt = buf->chan->private_data;
+	atomic_inc(&bt->dropped);
+	return 0;
+}
+
+static struct dentry *blk_create_buf_file_callback_rdma(const char *filename, struct dentry *parent, umode_t mode,
+                                                        struct rchan_buf *buf, int *is_global)
+{
+	//NOTE: debugfs_create_file() doesn't support mmap(), need to use the unsafe version; need to allow (RDMA) writes
+	return debugfs_create_file_unsafe(filename, mode | S_IWUSR, parent, buf, &relay_file_operations);
+}
+
+static struct rchan_callbacks blk_relay_callbacks_rdma = {
+	.subbuf_start    = blk_subbuf_start_callback_rdma,
+	.create_buf_file = blk_create_buf_file_callback_rdma,
+	.remove_buf_file = blk_remove_buf_file_callback,
+};
+
+#endif// CONFIG_RBLKTRACE
+
+
 static void blk_trace_setup_lba(struct blk_trace *bt,
 				struct block_device *bdev)
 {
@@ -443,6 +507,10 @@ int do_blk_trace_setup(struct request_queue *q, char *name, dev_t dev,
 
 	if (!buts->buf_size || !buts->buf_nr)
 		return -EINVAL;
+
+#ifdef CONFIG_RBLKTRACE
+	if (buts->use_rdma && (buts->buf_size <= rblktrace_buf_header_size(buts->buf_nr))) return -EINVAL;
+#endif
 
 	strncpy(buts->name, name, BLKTRACE_BDEV_SIZE);
 	buts->name[BLKTRACE_BDEV_SIZE - 1] = '\0';
@@ -498,8 +566,13 @@ int do_blk_trace_setup(struct request_queue *q, char *name, dev_t dev,
 	if (!bt->msg_file)
 		goto err;
 
+#ifdef CONFIG_RBLKTRACE
+	bt->rchan = relay_open("trace", dir, buts->buf_size, buts->buf_nr,
+	                       buts->use_rdma ? &blk_relay_callbacks_rdma : &blk_relay_callbacks, bt);
+#else
 	bt->rchan = relay_open("trace", dir, buts->buf_size,
 				buts->buf_nr, &blk_relay_callbacks, bt);
+#endif
 	if (!bt->rchan)
 		goto err;
 
