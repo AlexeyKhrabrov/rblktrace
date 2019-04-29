@@ -347,10 +347,10 @@ static int (*handle_list)(struct tracer_devpath_head *, struct list_head *);
 #ifdef RBLKTRACE
 
 static bool use_rdma = false;
-static const char *rdma_port = "8463";
-static int max_ncpus = 64;
+static char rdma_port[sizeof("65535")];
+static int max_ncpus = 32;
 static int max_ndevs = 4;
-static int rdma_interval = 10;// msec
+static int rdma_interval = 100;// msec
 
 #endif
 
@@ -541,9 +541,9 @@ static char usage_str[] = "\n\n"
 	"\t-V Print program version info\n"
 #ifdef RBLKTRACE
 	"\t-R Use RDMA network mode; default port 8463\n"
-	"\t-m Maximum number of client CPUs (default 64)\n"
+	"\t-m Maximum number of client CPUs (default 32)\n"
 	"\t-M Maximum number of client devices (default 4)\n"
-	"\t-i RDMA server read interval in milliseconds (default 10)\n"
+	"\t-i RDMA server read interval in milliseconds (default 100)\n"
 #endif
 	"\n";
 
@@ -2125,6 +2125,8 @@ static void handle_sigint(__attribute__((__unused__)) int sig)
 
 #ifdef RBLKTRACE
 static const char *rbt_client_hostname(struct devpath *dpp);
+static size_t rbt_header_reads(struct devpath *dpp, int cpu);
+static size_t rbt_data_reads(struct devpath *dpp, int cpu);
 #endif
 
 static void show_stats(struct list_head *devpaths)
@@ -2156,6 +2158,10 @@ static void show_stats(struct list_head *devpaths)
 
 		data_read = 0;
 		nevents = 0;
+#ifdef RBLKTRACE
+		size_t header_reads = 0;
+		size_t data_reads = 0;
+#endif
 
 		fprintf(ofp, "=== %s ===\n", dpp->buts_name);
 		for (cpu = 0, sp = dpp->stats; cpu < dpp->ncpus; cpu++, sp++) {
@@ -2173,11 +2179,26 @@ static void show_stats(struct list_head *devpaths)
 
 			data_read += sp->data_read;
 			nevents += sp->nevents;
+
+#ifdef RBLKTRACE
+			if (net_mode == Net_server_rdma) {
+				fprintf(ofp, "      %zu header reads, %zu data reads\n",
+				        rbt_header_reads(dpp, cpu), rbt_data_reads(dpp, cpu));
+				header_reads += rbt_header_reads(dpp, cpu);
+				data_reads += rbt_data_reads(dpp, cpu);
+			}
+#endif
 		}
 
 		fprintf(ofp, "  Total:  %20llu events (dropped %llu),"
 			     " %8llu KiB data\n", nevents,
 			     dpp->drops, (data_read + 1023) >> 10);
+
+#ifdef RBLKTRACE
+		if (net_mode == Net_server_rdma) {
+			fprintf(ofp, "      %zu header reads, %zu data reads\n", header_reads, data_reads);
+		}
+#endif
 
 		total_drops += dpp->drops;
 		total_events += (nevents + dpp->drops);
@@ -2325,7 +2346,6 @@ static int handle_args(int argc, char *argv[])
 #ifdef RBLKTRACE
 		case 'R':
 			use_rdma = true;
-			if (optarg != NULL) rdma_port = optarg;
 			break;
 		case 'm':
 			if ((max_ncpus = atoi(optarg)) <= 0) {
@@ -2360,9 +2380,16 @@ static int handle_args(int argc, char *argv[])
 			case Net_server: net_mode = Net_server_rdma; break;
 			case Net_client: net_mode = Net_client_rdma; break;
 		}
+
+		if ((net_port < 0) || (net_port > USHRT_MAX)) {
+			fprintf(stderr, "Invalid RDMA port: %d\n", net_port);
+		}
+		snprintf(rdma_port, sizeof(rdma_port), "%d", net_port);
 	}
+
+	// Need more sub-buffers to mitigate delays due to on-demand memory registration on the server
 	if ((net_mode == Net_client_rdma) && !buf_nr_set) buf_nr = 16;
-#endif
+#endif// RBLKTRACE
 
 	while (optind < argc)
 		if (add_devpath(argv[optind++]) != 0)
@@ -3690,9 +3717,11 @@ typedef struct rbt_srv_buf {
 	uint32_t write_rkey;
 
 	rbt_buf_state_t state;
-	bool pending;
-	ibv_mr_t *header_mr;
 	timespec_t timestamp;// last time header was read (taken at RDMA read completion)
+	size_t header_reads;
+	size_t data_reads;
+
+	ibv_mr_t *header_mr;
 	rblktrace_buf_header_t header;// mirror of the relay buffer header on the client side
 } rbt_srv_buf_t;
 
@@ -3736,8 +3765,26 @@ typedef struct rbt_srv_cli_ctx {
 static const char *rbt_client_hostname(struct devpath *dpp)
 {
 	assert(dpp != NULL);
-	rbt_srv_dev_t *dev = container_of(dpp, rbt_srv_dev_t, dp);
-	return dev->ctx->hostname;
+	return container_of(dpp, rbt_srv_dev_t, dp)->ctx->hostname;
+}
+
+
+static inline rbt_srv_buf_t *rbt_srv_buf_at(rbt_srv_dev_t *dev, size_t idx)
+{
+	assert(dev != NULL);
+	return (rbt_srv_buf_t*)(dev->data + idx * rbt_srv_buf_size(dev->ctx->buf_nr));
+}
+
+static size_t rbt_header_reads(struct devpath *dpp, int cpu)
+{
+	assert(dpp != NULL);
+	return rbt_srv_buf_at(container_of(dpp, rbt_srv_dev_t, dp), cpu)->header_reads;
+}
+
+static size_t rbt_data_reads(struct devpath *dpp, int cpu)
+{
+	assert(dpp != NULL);
+	return rbt_srv_buf_at(container_of(dpp, rbt_srv_dev_t, dp), cpu)->data_reads;
 }
 
 
@@ -3776,15 +3823,14 @@ static bool rbt_srv_buf_init(rbt_srv_buf_t *buf, rbt_buf_info_t *info, rbt_srv_d
 	buf->mmap_info = (mmap_info_t){ .buf_size = dev->ctx->buf_size, .buf_nr = dev->ctx->buf_nr, .pagesize = pagesize };
 
 	buf->remote_addr = info->addr;
-	buf->read_rkey = info->read_rkey;
-	buf->write_rkey = info->write_rkey;
-
-	// Ignore non-existent buffers/CPUs
-	if (buf->remote_addr == NULL) buf->state = done_last_header_write;
+	buf->read_rkey   = info->read_rkey;
+	buf->write_rkey  = info->write_rkey;
 
 	buf->header_mr = rbt_reg_msgs(dev->ctx->id, &(buf->header), rblktrace_buf_header_size(dev->ctx->buf_nr));
 	if (buf->header_mr == NULL) goto error;
 
+	// Ignore non-existent buffers/CPUs
+	buf->state = (buf->remote_addr != NULL) ? no_data : done_last_header_write;
 	buf->timestamp = get_time();
 	return true;
 
@@ -3793,12 +3839,6 @@ error:
 	return false;
 }
 
-
-static inline rbt_srv_buf_t *rbt_srv_buf_at(rbt_srv_dev_t *dev, size_t idx)
-{
-	assert(dev != NULL);
-	return (rbt_srv_buf_t*)(dev->data + idx * rbt_srv_buf_size(dev->ctx->buf_nr));
-}
 
 static void rbt_srv_dev_destroy(rbt_srv_dev_t *dev, int last_cpu)
 {
@@ -4117,8 +4157,6 @@ static bool rbt_post_header_read(rbt_srv_dev_t *dev, int cpu)
 		return false;
 	}
 
-	assert(!buf->pending);
-	buf->pending = true;
 	buf->state = !dev->ctx->closing ? posted_header_read : posted_last_header_read;
 	return true;
 }
@@ -4127,7 +4165,6 @@ static bool rbt_header_read_comp(rbt_srv_dev_t *dev, int cpu)
 {
 	rbt_srv_buf_t *buf = rbt_srv_buf_at(dev, cpu);
 	assert((buf->state == posted_header_read) || (buf->state == posted_last_header_read));
-	assert(buf->pending);
 	buf->timestamp = get_time();
 
 	if (buf->header.magic != RBLKTRACE_HEADER_MAGIC) {
@@ -4155,7 +4192,7 @@ static bool rbt_header_read_comp(rbt_srv_dev_t *dev, int cpu)
 
 	buf->state = (buf->state == posted_header_read) ? (has_data ? new_data : no_data)
 	                                                : (has_data ? last_data : done_last_header_write);
-	buf->pending = false;
+	buf->header_reads++;
 	return true;
 }
 
@@ -4179,7 +4216,6 @@ static bool rbt_post_data_read(rbt_srv_dev_t *dev, int cpu)
 {
 	rbt_srv_buf_t *buf = rbt_srv_buf_at(dev, cpu);
 	assert((buf->state == new_data) || (buf->state == last_data));
-	assert(!buf->pending);
 
 	size_t subbuf_idx = buf->header.consumed % dev->ctx->buf_nr;
 	assert(buf->header.padding[subbuf_idx] <= (size_t)dev->ctx->buf_size);
@@ -4204,7 +4240,6 @@ static bool rbt_post_data_read(rbt_srv_dev_t *dev, int cpu)
 	}
 
 	buf->state = (buf->state == new_data) ? posted_data_read : posted_last_data_read;
-	buf->pending = true;
 	return true;
 }
 
@@ -4214,7 +4249,6 @@ static bool rbt_data_read_comp(rbt_srv_dev_t *dev, int cpu, ibv_wc_t *wc)
 
 	rbt_srv_buf_t *buf = rbt_srv_buf_at(dev, cpu);
 	assert((buf->state == posted_data_read) || (buf->state == posted_last_data_read));
-	assert(buf->pending);
 
 	buf->mmap_info.fs_off += wc->byte_len;
 	buf->mmap_info.fs_size += wc->byte_len;
@@ -4222,7 +4256,7 @@ static bool rbt_data_read_comp(rbt_srv_dev_t *dev, int cpu, ibv_wc_t *wc)
 	buf->header.consumed++;
 
 	buf->state = (buf->state == posted_data_read) ? done_data_read : done_last_data_read;
-	buf->pending = false;
+	buf->data_reads++;
 	return true;
 }
 
@@ -4231,7 +4265,6 @@ static bool rbt_post_header_write(rbt_srv_dev_t *dev, int cpu)
 {
 	rbt_srv_buf_t *buf = rbt_srv_buf_at(dev, cpu);
 	assert((buf->state == done_data_read) || (buf->state == done_last_data_read));
-	assert(!buf->pending);
 
 	rbt_comp_ctx_t *comp = rbt_comp_ctx_create(dev, cpu, rbt_op_header_write);
 	if (comp == NULL) return false;
@@ -4244,7 +4277,6 @@ static bool rbt_post_header_write(rbt_srv_dev_t *dev, int cpu)
 	}
 
 	buf->state = (buf->state == done_data_read) ? posted_header_write : posted_last_header_write;
-	buf->pending = true;
 	return true;
 }
 
@@ -4252,15 +4284,12 @@ static bool rbt_header_write_comp(rbt_srv_dev_t *dev, int cpu)
 {
 	rbt_srv_buf_t *buf = rbt_srv_buf_at(dev, cpu);
 	assert((buf->state == posted_header_write) || (buf->state == posted_last_header_write));
-	assert(buf->pending);
 
 	if (buf->header.produced > buf->header.consumed) {
 		buf->state = (buf->state == posted_header_write) ? new_data : last_data;
 	} else {
 		buf->state = (buf->state == posted_header_write) ? no_data : done_last_header_write;
 	}
-
-	buf->pending = false;
 	return true;
 }
 
@@ -4394,56 +4423,25 @@ static bool rbt_handle_buffer(rbt_srv_dev_t *dev, int cpu)
 	rbt_srv_buf_t *buf = rbt_srv_buf_at(dev, cpu);
 
 	switch (buf->state) {
-	case no_data:
-		if (dev->ctx->closing || (time_to_msec(time_diff(get_time(), buf->timestamp)) >= (double)rdma_interval)) {
-			return rbt_post_header_read(dev, cpu);
-		}
-		assert(!buf->pending);
-		return true;
+		case no_data:
+			if (dev->ctx->closing || (time_to_msec(time_diff(get_time(), buf->timestamp)) >= (double)rdma_interval)) {
+				return rbt_post_header_read(dev, cpu);
+			}
+			return true;
 
-	case posted_header_read:
-		assert(buf->pending);
-		return true;
+		case posted_header_read:       return true;
+		case new_data:                 return rbt_post_data_read(dev, cpu);
+		case posted_data_read:         return true;
+		case done_data_read:           return rbt_post_header_write(dev, cpu);
+		case posted_header_write:      return true;
+		case posted_last_header_read:  return true;
+		case last_data:                return rbt_post_data_read(dev, cpu);
+		case posted_last_data_read:    return true;
+		case done_last_data_read:      return rbt_post_header_write(dev, cpu);
+		case posted_last_header_write: return true;
+		case done_last_header_write:   return true;
 
-	case new_data:
-		return rbt_post_data_read(dev, cpu);
-
-	case posted_data_read:
-		assert(buf->pending);
-		return true;
-
-	case done_data_read:
-		return rbt_post_header_write(dev, cpu);
-
-	case posted_header_write:
-		assert(buf->pending);
-		return true;
-
-	case posted_last_header_read:
-		assert(buf->pending);
-		return true;
-
-	case last_data:
-		return rbt_post_data_read(dev, cpu);
-
-	case posted_last_data_read:
-		assert(buf->pending);
-		return true;
-
-	case done_last_data_read:
-		return rbt_post_header_write(dev, cpu);
-
-	case posted_last_header_write:
-		assert(buf->pending);
-		return true;
-
-	case done_last_header_write:
-		assert(!buf->pending);
-		return true;
-
-	default:
-		assert(false);
-		return false;
+		default: assert(false); return false;
 	}
 }
 
